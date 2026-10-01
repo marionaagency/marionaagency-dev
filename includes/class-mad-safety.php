@@ -292,8 +292,10 @@ class MAD_Safety {
 			return $result;
 		}
 
-		// Metadatos: reponemos el estado exacto que había.
-		if ( ! empty( $meta['meta'] ) && is_array( $meta['meta'] ) ) {
+		// Metadatos: reponemos el estado exacto que había. También cuando la
+		// copia no tenía ninguno (lista vacía): antes se saltaba y la meta
+		// añadida después del cambio se quedaba (1/10/26).
+		if ( isset( $meta['meta'] ) && is_array( $meta['meta'] ) ) {
 			$current = get_post_meta( $meta['post_id'] );
 			foreach ( array_keys( $current ) as $key ) {
 				delete_post_meta( $meta['post_id'], $key );
@@ -304,6 +306,19 @@ class MAD_Safety {
 					// Elementor (_elementor_data) volvía roto del rollback.
 					add_post_meta( $meta['post_id'], $key, wp_slash( maybe_unserialize( $value ) ) );
 				}
+			}
+		}
+
+		// Yoast sirve título y descripción desde su indexable, no desde la
+		// meta: se reconstruye para que la web muestre lo restaurado.
+		if ( function_exists( 'YoastSEO' ) ) {
+			try {
+				$builder = YoastSEO()->classes->get( \Yoast\WP\SEO\Builders\Indexable_Builder::class );
+				$repo    = YoastSEO()->classes->get( \Yoast\WP\SEO\Repositories\Indexable_Repository::class );
+				$current = $repo->find_by_id_and_type( (int) $meta['post_id'], 'post', false );
+				$builder->build_for_id_and_type( (int) $meta['post_id'], 'post', $current ? $current : false );
+			} catch ( \Throwable $e ) {
+				// Sin indexable reconstruido la restauración sigue siendo válida en la base de datos.
 			}
 		}
 
