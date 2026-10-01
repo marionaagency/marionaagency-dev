@@ -284,6 +284,11 @@ class MAD_Route_Content extends MAD_Controller {
 			return $raw;
 		}
 
+		$rejected = $this->rejected_meta_keys( $request->get_param( 'meta' ) );
+		if ( $rejected ) {
+			return $this->meta_rejected_error( $rejected );
+		}
+
 		if ( $this->is_dry( $request ) ) {
 			return $this->dry(
 				sprintf( 'Se crearía un «%s» titulado «%s».', $args['post_type'], $args['post_title'] ?? '(sin título)' ),
@@ -296,13 +301,17 @@ class MAD_Route_Content extends MAD_Controller {
 			return $id;
 		}
 
-		$this->apply_meta_and_terms( $id, $request );
+		$report = $this->apply_meta_and_terms( $id, $request );
+		if ( $report['failed'] ) {
+			return $this->meta_failed_error( $id, $report, null );
+		}
 
 		return $this->ok(
 			array(
 				'applied' => true,
 				'summary' => sprintf( 'Creado %s #%d «%s».', $args['post_type'], $id, get_the_title( $id ) ),
 				'post'    => $this->shape_post( $id, false ),
+				'meta'    => $report,
 			),
 			201
 		);
@@ -324,6 +333,11 @@ class MAD_Route_Content extends MAD_Controller {
 			return $raw;
 		}
 
+		$rejected = $this->rejected_meta_keys( $request->get_param( 'meta' ) );
+		if ( $rejected ) {
+			return $this->meta_rejected_error( $rejected );
+		}
+
 		if ( $this->is_dry( $request ) ) {
 			return $this->dry(
 				sprintf( 'Se actualizaría #%d «%s».', $id, $post->post_title ),
@@ -342,7 +356,10 @@ class MAD_Route_Content extends MAD_Controller {
 			return $result;
 		}
 
-		$this->apply_meta_and_terms( $id, $request );
+		$report = $this->apply_meta_and_terms( $id, $request );
+		if ( $report['failed'] ) {
+			return $this->meta_failed_error( $id, $report, $backup );
+		}
 
 		return $this->ok(
 			array(
@@ -350,6 +367,7 @@ class MAD_Route_Content extends MAD_Controller {
 				'summary'    => sprintf( 'Actualizado #%d «%s».', $id, get_the_title( $id ) ),
 				'backup_ref' => $backup,
 				'post'       => $this->shape_post( $id, false ),
+				'meta'       => $report,
 			)
 		);
 	}
@@ -401,6 +419,14 @@ class MAD_Route_Content extends MAD_Controller {
 			return $this->error( 'mad_not_found', 'No existe ese contenido.', 404 );
 		}
 
+		// Rechazo ANTES de escribir: si alguna clave no se puede escribir por
+		// esta vía, no se toca nada. Antes se saltaba en silencio y la
+		// respuesta contaba las claves recibidas, no las escritas (1/10/26).
+		$rejected = $this->rejected_meta_keys( $meta );
+		if ( $rejected ) {
+			return $this->meta_rejected_error( $rejected );
+		}
+
 		if ( $this->is_dry( $request ) ) {
 			return $this->dry(
 				sprintf( 'Se escribirían %d claves de meta en #%d.', count( $meta ), $id ),
@@ -413,21 +439,42 @@ class MAD_Route_Content extends MAD_Controller {
 			return $backup;
 		}
 
-		foreach ( $meta as $key => $value ) {
-			if ( $this->is_protected_meta( $key ) ) {
-				continue;
-			}
-			if ( null === $value ) {
-				delete_post_meta( $id, $key );
-			} else {
-				update_post_meta( $id, $key, $value );
-			}
+		$report = $this->write_meta( $id, $meta );
+
+		if ( $report['failed'] ) {
+			return new WP_Error(
+				'mad_meta_not_saved',
+				sprintf(
+					'No han quedado guardadas %d de %d claves en #%d: %s. Copia previa: %s.',
+					count( $report['failed'] ),
+					count( $meta ),
+					$id,
+					implode( ', ', $report['failed'] ),
+					$backup
+				),
+				array(
+					'status'     => 409,
+					'failed'     => $report['failed'],
+					'written'    => $report['written'],
+					'deleted'    => $report['deleted'],
+					'backup_ref' => $backup,
+				)
+			);
 		}
 
 		return $this->ok(
 			array(
 				'applied'    => true,
-				'summary'    => sprintf( 'Escritas %d claves de meta en #%d.', count( $meta ), $id ),
+				'summary'    => sprintf(
+					'Escritas y comprobadas %d claves de meta en #%d%s.',
+					count( $report['written'] ) + count( $report['deleted'] ),
+					$id,
+					$report['deleted'] ? sprintf( ' (%d borradas)', count( $report['deleted'] ) ) : ''
+				),
+				'written'    => $report['written'],
+				'deleted'    => $report['deleted'],
+				'normalized' => $report['normalized'],
+				'yoast'      => $report['yoast'],
 				'backup_ref' => $backup,
 				'meta'       => $this->readable_meta( $id ),
 			)
@@ -685,15 +732,18 @@ class MAD_Route_Content extends MAD_Controller {
 		return false;
 	}
 
+	/**
+	 * Aplica meta, términos y destacada después de crear o actualizar.
+	 * Devuelve el parte de la meta: escritas, borradas y fallidas
+	 * (comprobadas releyendo la base de datos). Las claves no permitidas
+	 * ya se han rechazado antes de escribir nada (rejected_meta_keys).
+	 */
 	private function apply_meta_and_terms( $post_id, $request ) {
+		$report = array( 'written' => array(), 'deleted' => array(), 'normalized' => array(), 'failed' => array(), 'yoast' => null );
+
 		$meta = $request->get_param( 'meta' );
-		if ( is_array( $meta ) ) {
-			foreach ( $meta as $key => $value ) {
-				if ( $this->is_protected_meta( $key ) ) {
-					continue;
-				}
-				update_post_meta( $post_id, $key, $value );
-			}
+		if ( is_array( $meta ) && $meta ) {
+			$report = $this->write_meta( $post_id, $meta );
 		}
 
 		$terms = $request->get_param( 'terms' );
@@ -710,13 +760,191 @@ class MAD_Route_Content extends MAD_Controller {
 		if ( $thumb ) {
 			set_post_thumbnail( $post_id, (int) $thumb );
 		}
+
+		return $report;
 	}
 
 	/**
 	 * Meta oculta de WordPress que no debe tocarse a ciegas.
+	 * Excepciones: Elementor, Divi, destacada, plantilla y las claves de
+	 * Yoast de writable_protected_meta() (1/10/26).
 	 */
 	private function is_protected_meta( $key ) {
-		return is_protected_meta( $key, 'post' ) && 0 !== strpos( $key, '_elementor' ) && 0 !== strpos( $key, '_et_' ) && '_thumbnail_id' !== $key && '_wp_page_template' !== $key;
+		$key = (string) $key;
+		if ( ! is_protected_meta( $key, 'post' ) ) {
+			return false;
+		}
+		if ( 0 === strpos( $key, '_elementor' ) || 0 === strpos( $key, '_et_' ) || '_thumbnail_id' === $key || '_wp_page_template' === $key ) {
+			return false;
+		}
+		return ! in_array( $key, $this->writable_protected_meta(), true );
+	}
+
+	/**
+	 * Meta oculta que sí se puede escribir por esta vía: la de Yoast que
+	 * hace falta para el SEO de una página. Ampliable sin tocar el plugin
+	 * con el filtro «mad_writable_protected_meta».
+	 */
+	private function writable_protected_meta() {
+		$keys = array(
+			'_yoast_wpseo_title',
+			'_yoast_wpseo_metadesc',
+			'_yoast_wpseo_focuskw',
+			'_yoast_wpseo_canonical',
+			'_yoast_wpseo_meta-robots-noindex',
+			'_yoast_wpseo_meta-robots-nofollow',
+			'_yoast_wpseo_meta-robots-adv',
+			'_yoast_wpseo_bctitle',
+			'_yoast_wpseo_opengraph-title',
+			'_yoast_wpseo_opengraph-description',
+			'_yoast_wpseo_opengraph-image',
+			'_yoast_wpseo_opengraph-image-id',
+			'_yoast_wpseo_twitter-title',
+			'_yoast_wpseo_twitter-description',
+			'_yoast_wpseo_twitter-image',
+			'_yoast_wpseo_twitter-image-id',
+			'_yoast_wpseo_is_cornerstone',
+			'_yoast_wpseo_primary_category',
+		);
+		return array_values( array_unique( array_map( 'strval', (array) apply_filters( 'mad_writable_protected_meta', $keys ) ) ) );
+	}
+
+	/**
+	 * Claves de una petición que no se pueden escribir por esta vía.
+	 */
+	private function rejected_meta_keys( $meta ) {
+		if ( ! is_array( $meta ) ) {
+			return array();
+		}
+		$out = array();
+		foreach ( array_keys( $meta ) as $key ) {
+			if ( '' === (string) $key || $this->is_protected_meta( $key ) ) {
+				$out[] = (string) $key;
+			}
+		}
+		return $out;
+	}
+
+	private function meta_rejected_error( $rejected ) {
+		return new WP_Error(
+			'mad_meta_protected',
+			sprintf(
+				'No se ha escrito nada: %s es meta protegida de WordPress y no se puede escribir por esta vía. Si hace falta, se añade al filtro «mad_writable_protected_meta».',
+				implode( ', ', $rejected )
+			),
+			array( 'status' => 422, 'rejected' => $rejected )
+		);
+	}
+
+	private function meta_failed_error( $post_id, $report, $backup ) {
+		return new WP_Error(
+			'mad_meta_not_saved',
+			sprintf(
+				'El contenido #%d se ha guardado, pero no han quedado guardadas estas claves de meta: %s.%s',
+				$post_id,
+				implode( ', ', $report['failed'] ),
+				$backup ? ' Copia previa: ' . $backup . '.' : ''
+			),
+			array(
+				'status'     => 409,
+				'post_id'    => (int) $post_id,
+				'failed'     => $report['failed'],
+				'written'    => $report['written'],
+				'deleted'    => $report['deleted'],
+				'backup_ref' => $backup,
+			)
+		);
+	}
+
+	/**
+	 * Escribe la meta y comprueba cada clave releyendo la base de datos.
+	 * Si se ha escrito alguna clave de Yoast, reconstruye su indexable:
+	 * la web sirve el título y la descripción del indexable, no de la meta.
+	 */
+	private function write_meta( $post_id, $meta ) {
+		$report = array( 'written' => array(), 'deleted' => array(), 'normalized' => array(), 'failed' => array(), 'yoast' => null );
+		$yoast  = false;
+		$type   = get_post_type( $post_id );
+
+		foreach ( $meta as $key => $value ) {
+			$key = (string) $key;
+			if ( null === $value ) {
+				delete_post_meta( $post_id, $key );
+			} else {
+				// wp_slash: update_post_meta() quita barras. Así se guarda lo
+				// que llegó, como hace la API REST de WordPress con su meta.
+				update_post_meta( $post_id, $key, wp_slash( $value ) );
+			}
+			wp_cache_delete( $post_id, 'post_meta' );
+
+			if ( null === $value ) {
+				if ( metadata_exists( 'post', $post_id, $key ) ) {
+					$report['failed'][] = $key;
+				} else {
+					$report['deleted'][] = $key;
+				}
+			} else {
+				// Lo que WordPress debe haber guardado: el valor tras la
+				// limpieza registrada para esa clave (Yoast, por ejemplo,
+				// quita etiquetas y espacios de más en títulos y descripciones).
+				$expected = sanitize_meta( $key, $value, 'post', $type );
+				if ( $this->meta_matches( get_post_meta( $post_id, $key, true ), $expected ) ) {
+					$report['written'][] = $key;
+					if ( ! $this->meta_matches( $expected, $value ) ) {
+						$report['normalized'][] = $key;
+					}
+				} else {
+					$report['failed'][] = $key;
+				}
+			}
+
+			if ( 0 === strpos( $key, '_yoast_wpseo_' ) ) {
+				$yoast = true;
+			}
+		}
+
+		if ( $yoast ) {
+			$report['yoast'] = $this->rebuild_yoast_indexable( $post_id );
+		}
+
+		// La caché de página (WP Rocket) guardaría el HTML con lo anterior.
+		if ( $report['written'] || $report['deleted'] ) {
+			clean_post_cache( $post_id );
+			if ( function_exists( 'rocket_clean_post' ) ) {
+				rocket_clean_post( $post_id );
+			}
+		}
+
+		return $report;
+	}
+
+	/**
+	 * ¿Lo guardado es lo esperado? WordPress guarda los escalares como
+	 * texto (true como «1», false como cadena vacía).
+	 */
+	private function meta_matches( $stored, $expected ) {
+		if ( is_scalar( $expected ) ) {
+			if ( is_bool( $expected ) ) {
+				$expected = $expected ? '1' : '';
+			}
+			return is_scalar( $stored ) && (string) $stored === (string) $expected;
+		}
+		return maybe_serialize( $stored ) === maybe_serialize( $expected );
+	}
+
+	private function rebuild_yoast_indexable( $post_id ) {
+		if ( ! function_exists( 'YoastSEO' ) ) {
+			return 'sin Yoast';
+		}
+		try {
+			$builder = YoastSEO()->classes->get( \Yoast\WP\SEO\Builders\Indexable_Builder::class );
+			$repo    = YoastSEO()->classes->get( \Yoast\WP\SEO\Repositories\Indexable_Repository::class );
+			$current = $repo->find_by_id_and_type( (int) $post_id, 'post', false );
+			$builder->build_for_id_and_type( (int) $post_id, 'post', $current ? $current : false );
+			return 'indexable reconstruido';
+		} catch ( \Throwable $e ) {
+			return 'indexable no reconstruido: ' . $e->getMessage();
+		}
 	}
 
 	private function readable_meta( $post_id ) {
