@@ -3,7 +3,7 @@
  * Plugin Name:       MarionaAgency Dev
  * Plugin URI:        https://marionaagency.com/mad
  * Description:       Puente seguro entre Claude y esta web. API REST completa con scopes, auditoría, backups automáticos y rollback. Se registra solo en el hub de la agencia.
- * Version:           0.2.0
+ * Version:           0.2.1
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            MarionaAgency
@@ -18,7 +18,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'MAD_VERSION', '0.2.0' );
+define( 'MAD_VERSION', '0.2.1' );
 define( 'MAD_FILE', __FILE__ );
 define( 'MAD_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MAD_URL', plugin_dir_url( __FILE__ ) );
